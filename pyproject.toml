@@ -1,0 +1,11 @@
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+# B008 flags `Depends(...)` in argument defaults as a general Python
+# anti-pattern (mutable/call default), but it's the documented, intended
+# FastAPI dependency-injection idiom -- FastAPI itself calls this at
+# request time, not at import time. Ignoring it here rather than
+# sprinkling `# noqa: B008` on every route.
+ignore = ["B008"]

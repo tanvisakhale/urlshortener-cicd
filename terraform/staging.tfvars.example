@@ -1,0 +1,11 @@
+# Copy to staging.tfvars (gitignored) and fill in real values.
+# Apply with: terraform apply -var-file=staging.tfvars
+#
+# manage_shared_resources defaults to true (see variables.tf) -- leave it
+# true here since staging is applied first and creates the account-global
+# ECR repo + GitHub OIDC provider that production will then reuse.
+
+aws_region         = "ap-south-1"
+project_name       = "url-shortener"
+environment        = "staging"
+github_repository  = "your-org/urlshortener-cicd"

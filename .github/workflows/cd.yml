@@ -1,0 +1,243 @@
+name: CD
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write # required for OIDC -> AWS
+  contents: read
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: url-shortener
+  EKS_CLUSTER_STAGING: url-shortener-staging
+  EKS_CLUSTER_PRODUCTION: url-shortener-production
+  RDS_IDENTIFIER_STAGING: url-shortener-staging
+  RDS_IDENTIFIER_PRODUCTION: url-shortener-production
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: pytest -v
+
+  build-and-push:
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.vars.outputs.image_tag }}
+      ecr_registry: ${{ steps.login-ecr.outputs.registry }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: vars
+        run: echo "image_tag=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+      # No long-lived AWS keys: assume a role via GitHub's OIDC token.
+      # ECR is a single shared repository across environments (see
+      # terraform/eks.tf), so either environment's role can push to it;
+      # we use the staging role here since staging is applied with
+      # manage_shared_resources = true and therefore "owns" the repo.
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN_STAGING }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build image
+        run: |
+          docker build -t $ECR_REPOSITORY:${{ steps.vars.outputs.image_tag }} .
+          docker tag $ECR_REPOSITORY:${{ steps.vars.outputs.image_tag }} \
+            ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY:${{ steps.vars.outputs.image_tag }}
+
+      - name: Scan image (Trivy)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: "${{ env.ECR_REPOSITORY }}:${{ steps.vars.outputs.image_tag }}"
+          severity: "CRITICAL,HIGH"
+          exit-code: "1"
+
+      - name: Push image to ECR
+        run: |
+          docker push ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY:${{ steps.vars.outputs.image_tag }}
+        # Immutable, commit-SHA tags only -- never ':latest' -- so every
+        # deploy is traceable to an exact commit and rollbacks are exact.
+
+  deploy-staging:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment: staging
+    env:
+      NAMESPACE: staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN_STAGING }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name $EKS_CLUSTER_STAGING --region $AWS_REGION
+
+      # --- Fix: connect to the REAL Terraform-provisioned RDS instead of ---
+      # --- a hard-coded placeholder host.                                ---
+      # The RDS-managed master-user secret (manage_master_user_password =
+      # true in terraform/rds.tf) already contains host/port/username/
+      # password/dbname as JSON -- AWS generated it, Terraform never saw
+      # the plaintext, and this is the only place that ever reads it.
+      - name: Fetch RDS connection info and update Kubernetes Secret
+        run: |
+          set -euo pipefail
+          SECRET_ARN=$(aws rds describe-db-instances \
+            --db-instance-identifier "$RDS_IDENTIFIER_STAGING" \
+            --query 'DBInstances[0].MasterUserSecret.SecretArn' --output text)
+          DB_JSON=$(aws secretsmanager get-secret-value --secret-id "$SECRET_ARN" --query SecretString --output text)
+          DB_HOST=$(echo "$DB_JSON" | jq -r .host)
+          DB_PORT=$(echo "$DB_JSON" | jq -r .port)
+          DB_USER=$(echo "$DB_JSON" | jq -r .username)
+          DB_PASSWORD=$(echo "$DB_JSON" | jq -r .password)
+          DB_NAME=$(echo "$DB_JSON" | jq -r .dbname)
+
+          kubectl create secret generic url-shortener-secret -n "$NAMESPACE" \
+            --from-literal=DATABASE_HOST="$DB_HOST" \
+            --from-literal=DATABASE_PORT="$DB_PORT" \
+            --from-literal=DATABASE_USER="$DB_USER" \
+            --from-literal=DATABASE_PASSWORD="$DB_PASSWORD" \
+            --from-literal=DATABASE_NAME="$DB_NAME" \
+            --dry-run=client -o yaml | kubectl apply -f -
+        # Nothing here is echoed/logged: `set -x` is not enabled, and none
+        # of these values are passed to `echo` on their own.
+
+      - name: Deploy via kustomize
+        run: |
+          cd k8s/overlays/staging
+          kustomize edit set image url-shortener=${{ needs.build-and-push.outputs.ecr_registry }}/$ECR_REPOSITORY:${{ needs.build-and-push.outputs.image_tag }}
+          kubectl apply -k .
+
+      - name: Wait for rollout
+        run: kubectl rollout status deployment/url-shortener -n "$NAMESPACE" --timeout=180s
+
+      # --- Fix: no hard-coded BASE_SHORT_URL / no placeholder domain. ---
+      # The Service is type=LoadBalancer (see k8s/base/service.yaml); once
+      # the AWS Load Balancer Controller provisions the NLB, Kubernetes
+      # populates the Service's real external hostname. We read that back
+      # and inject it as BASE_SHORT_URL so the app never has to guess its
+      # own public URL.
+      - name: Discover LoadBalancer hostname and set BASE_SHORT_URL
+        run: |
+          set -euo pipefail
+          LB_HOST=""
+          for i in $(seq 1 30); do
+            LB_HOST=$(kubectl get svc url-shortener -n "$NAMESPACE" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' || true)
+            [ -n "$LB_HOST" ] && break
+            echo "Waiting for LoadBalancer hostname... ($i/30)"
+            sleep 10
+          done
+          if [ -z "$LB_HOST" ]; then
+            echo "::warning::No LoadBalancer hostname after 5 minutes. Is the AWS Load Balancer Controller installed on this cluster? See docs/architecture.md."
+          else
+            kubectl set env deployment/url-shortener -n "$NAMESPACE" BASE_SHORT_URL="http://$LB_HOST"
+            kubectl rollout status deployment/url-shortener -n "$NAMESPACE" --timeout=120s
+          fi
+
+      - name: Smoke test /health
+        run: |
+          kubectl run smoke-test-$RANDOM --rm -i --restart=Never --image=curlimages/curl -n "$NAMESPACE" -- \
+            curl -sf http://url-shortener."$NAMESPACE".svc.cluster.local/health
+
+  deploy-production:
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    environment: production # requires manual approval configured in repo settings
+    env:
+      NAMESPACE: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN_PRODUCTION }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name $EKS_CLUSTER_PRODUCTION --region $AWS_REGION
+
+      - name: Fetch RDS connection info and update Kubernetes Secret
+        run: |
+          set -euo pipefail
+          SECRET_ARN=$(aws rds describe-db-instances \
+            --db-instance-identifier "$RDS_IDENTIFIER_PRODUCTION" \
+            --query 'DBInstances[0].MasterUserSecret.SecretArn' --output text)
+          DB_JSON=$(aws secretsmanager get-secret-value --secret-id "$SECRET_ARN" --query SecretString --output text)
+          DB_HOST=$(echo "$DB_JSON" | jq -r .host)
+          DB_PORT=$(echo "$DB_JSON" | jq -r .port)
+          DB_USER=$(echo "$DB_JSON" | jq -r .username)
+          DB_PASSWORD=$(echo "$DB_JSON" | jq -r .password)
+          DB_NAME=$(echo "$DB_JSON" | jq -r .dbname)
+
+          kubectl create secret generic url-shortener-secret -n "$NAMESPACE" \
+            --from-literal=DATABASE_HOST="$DB_HOST" \
+            --from-literal=DATABASE_PORT="$DB_PORT" \
+            --from-literal=DATABASE_USER="$DB_USER" \
+            --from-literal=DATABASE_PASSWORD="$DB_PASSWORD" \
+            --from-literal=DATABASE_NAME="$DB_NAME" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Deploy via kustomize
+        run: |
+          cd k8s/overlays/production
+          kustomize edit set image url-shortener=${{ needs.build-and-push.outputs.ecr_registry }}/$ECR_REPOSITORY:${{ needs.build-and-push.outputs.image_tag }}
+          kubectl apply -k .
+
+      - name: Wait for rollout
+        run: kubectl rollout status deployment/url-shortener -n "$NAMESPACE" --timeout=180s
+
+      - name: Discover LoadBalancer hostname and set BASE_SHORT_URL
+        run: |
+          set -euo pipefail
+          LB_HOST=""
+          for i in $(seq 1 30); do
+            LB_HOST=$(kubectl get svc url-shortener -n "$NAMESPACE" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' || true)
+            [ -n "$LB_HOST" ] && break
+            echo "Waiting for LoadBalancer hostname... ($i/30)"
+            sleep 10
+          done
+          if [ -z "$LB_HOST" ]; then
+            echo "::warning::No LoadBalancer hostname after 5 minutes. Is the AWS Load Balancer Controller installed on this cluster? See docs/architecture.md."
+          else
+            kubectl set env deployment/url-shortener -n "$NAMESPACE" BASE_SHORT_URL="http://$LB_HOST"
+            kubectl rollout status deployment/url-shortener -n "$NAMESPACE" --timeout=120s
+          fi
+
+      - name: Verify rollout health
+        run: |
+          kubectl run smoke-test-$RANDOM --rm -i --restart=Never --image=curlimages/curl -n "$NAMESPACE" -- \
+            curl -sf http://url-shortener."$NAMESPACE".svc.cluster.local/health
+
+      # --- Fix: no automatic rollback. ---
+      # An automatic `kubectl rollout undo` on failure has never actually
+      # been exercised end-to-end against a real cluster in this project,
+      # and "automatically roll back" is exactly the kind of claim this
+      # repo avoids making without having tested it. If the job above
+      # fails, it fails loudly here and a human runs the documented,
+      # well-understood manual rollback (RUNBOOK.md "Rollback Strategy"):
+      #   kubectl rollout undo deployment/url-shortener -n production
+      - name: On failure, print manual rollback instructions
+        if: failure()
+        run: |
+          echo "::error::Production deployment/verification failed."
+          echo "Manual rollback: kubectl rollout undo deployment/url-shortener -n production"
+          echo "See RUNBOOK.md 'Rollback Strategy' for the full procedure."

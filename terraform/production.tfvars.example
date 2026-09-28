@@ -1,0 +1,14 @@
+# Copy to production.tfvars (gitignored) and fill in real values.
+# Apply with: terraform apply -var-file=production.tfvars -var manage_shared_resources=false
+
+aws_region              = "ap-south-1"
+project_name            = "url-shortener"
+environment             = "production"
+github_repository       = "your-org/urlshortener-cicd"
+manage_shared_resources = false   # staging apply already created the shared ECR repo + OIDC provider
+availability_zones      = ["ap-south-1a", "ap-south-1b"]
+eks_node_instance_types = ["t3.medium"]
+eks_node_desired_size   = 2
+eks_node_min_size       = 2
+eks_node_max_size       = 4
+db_instance_class       = "db.t3.small"

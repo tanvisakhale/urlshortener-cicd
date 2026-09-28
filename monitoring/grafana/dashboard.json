@@ -1,0 +1,71 @@
+{
+  "title": "URL Shortener - Service Dashboard",
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "panels": [
+    {
+      "id": 1,
+      "title": "Application Availability",
+      "type": "stat",
+      "targets": [{ "expr": "avg(up{job=\"url-shortener\"})" }],
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 }
+    },
+    {
+      "id": 2,
+      "title": "Requests per Second",
+      "type": "timeseries",
+      "targets": [{ "expr": "sum(rate(http_requests_total[1m]))" }],
+      "gridPos": { "h": 6, "w": 9, "x": 6, "y": 0 }
+    },
+    {
+      "id": 3,
+      "title": "HTTP Error Rate (%)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "100 * sum(rate(http_errors_total[5m])) / sum(rate(http_requests_total[5m]))"
+        }
+      ],
+      "gridPos": { "h": 6, "w": 9, "x": 15, "y": 0 }
+    },
+    {
+      "id": 4,
+      "title": "Response Latency (p50/p95/p99)",
+      "type": "timeseries",
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p95" },
+        { "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p99" }
+      ],
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 6 }
+    },
+    {
+      "id": 5,
+      "title": "CPU Utilization by Pod",
+      "type": "timeseries",
+      "targets": [{ "expr": "rate(container_cpu_usage_seconds_total{pod=~\"url-shortener.*\"}[5m])" }],
+      "gridPos": { "h": 6, "w": 6, "x": 12, "y": 6 }
+    },
+    {
+      "id": 6,
+      "title": "Memory Utilization by Pod",
+      "type": "timeseries",
+      "targets": [{ "expr": "container_memory_working_set_bytes{pod=~\"url-shortener.*\"}" }],
+      "gridPos": { "h": 6, "w": 6, "x": 18, "y": 6 }
+    },
+    {
+      "id": 7,
+      "title": "Pod Count",
+      "type": "stat",
+      "targets": [{ "expr": "count(kube_pod_info{pod=~\"url-shortener.*\"})" }],
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 12 }
+    },
+    {
+      "id": 8,
+      "title": "URLs Shortened (Total)",
+      "type": "stat",
+      "targets": [{ "expr": "sum(urls_shortened_total)" }],
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 12 }
+    }
+  ]
+}

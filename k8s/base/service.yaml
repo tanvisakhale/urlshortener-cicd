@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: url-shortener
+  labels:
+    app: url-shortener
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/path: "/metrics"
+    prometheus.io/port: "8000"
+    # Provisions an AWS Network Load Balancer for external access. This
+    # uses EKS's native LoadBalancer Service integration (no separate
+    # AWS Load Balancer Controller add-on to install/explain), which is
+    # the simplest reliable path to an external endpoint for a project
+    # at this scope. See docs/architecture.md for the trade-off against
+    # a full Ingress + ALB Controller setup (path-based routing, WAF).
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+spec:
+  type: LoadBalancer
+  selector:
+    app: url-shortener
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8000

@@ -1,0 +1,24 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: production
+
+# Declares the namespace explicitly rather than relying only on the
+# `namespace:` field above -- `kubectl apply -k` then creates the
+# namespace itself as part of the same apply.
+resources:
+  - ../../namespaces/production.yaml
+  - ../../base
+
+patches:
+  - path: replicas.yaml
+
+# NOTE: DATABASE_HOST/USER/PASSWORD are intentionally NOT set here as
+# static values (no more production-db.internal.example.com
+# placeholder). They're injected into the `url-shortener-secret` Secret
+# at deploy time by the CD pipeline -- see .github/workflows/cd.yml.
+
+images:
+  - name: url-shortener
+    newName: ${ECR_REGISTRY}/url-shortener
+    newTag: production-latest # overwritten by CI with the commit SHA

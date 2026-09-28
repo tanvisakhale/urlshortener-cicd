@@ -1,0 +1,27 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: staging
+
+# Declares the namespace explicitly rather than relying only on the
+# `namespace:` field above -- `kubectl apply -k` then creates the
+# namespace itself as part of the same apply, so this overlay is
+# deployable against a cluster where "staging" doesn't exist yet.
+resources:
+  - ../../namespaces/staging.yaml
+  - ../../base
+
+patches:
+  - path: replicas.yaml
+
+# NOTE: DATABASE_HOST/USER/PASSWORD are intentionally NOT set here as
+# static values (no more staging-db.internal.example.com placeholder).
+# They're injected into the `url-shortener-secret` Secret at deploy time
+# by the CD pipeline, which reads the real Terraform-provisioned RDS
+# endpoint and the AWS-managed master password -- see
+# .github/workflows/cd.yml and k8s/base/secret.yaml.
+
+images:
+  - name: url-shortener
+    newName: ${ECR_REGISTRY}/url-shortener
+    newTag: staging-latest # overwritten by CI with the commit SHA

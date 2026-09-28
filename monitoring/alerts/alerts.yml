@@ -1,0 +1,112 @@
+# Alerting rules for the URL Shortener service.
+#
+# Each alert below is documented with: condition, threshold, duration,
+# reason, and recommended troubleshooting (pointing at RUNBOOK.md, which
+# has the full Symptoms -> ... -> Prevention writeup for each).
+#
+# Thresholds are written as plain numbers rather than Prometheus template
+# variables, since this file is loaded directly by Prometheus (not
+# templated by Helm/Jsonnet in this project). To make a threshold
+# "configurable" in practice: edit the number below and reload Prometheus
+# (kill -HUP <pid> or a pod restart), or migrate this file to a
+# Helm-templated values.yaml if you introduce kube-prometheus-stack.
+groups:
+  - name: url-shortener-alerts
+    rules:
+      # --- Application unavailable -------------------------------------
+      # Condition: Prometheus's own scrape health for this job is down.
+      # Threshold: up == 0 (binary, no partial state).
+      # Duration:  2 minutes (short -- this is the most severe alert).
+      # Reason:    /health is what's being scraped, so this fires when
+      #            Kubernetes' own liveness/readiness probes are also
+      #            almost certainly failing.
+      - alert: ApplicationUnavailable
+        expr: up{job="url-shortener"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "URL Shortener is unreachable"
+          description: >
+            Prometheus has failed to scrape /metrics for 2+ minutes.
+            Troubleshooting: RUNBOOK.md incidents "Pod is CrashLoopBackOff"
+            and "Readiness probe failing" -- start with kubectl get pods.
+
+      # --- High HTTP error rate -----------------------------------------
+      # Condition: ratio of 5xx responses to all responses.
+      # Threshold: 5% (0.05).
+      # Duration:  5 minutes (filters out a brief blip from one failed
+      #            request or a deploy hiccup).
+      # Reason:    5xx responses indicate server-side failures the team,
+      #            not the caller, is responsible for fixing.
+      - alert: HighErrorRate
+        expr: |
+          sum(rate(http_errors_total[5m]))
+          /
+          sum(rate(http_requests_total[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "HTTP 5xx error rate above 5%"
+          description: >
+            Threshold: 5% of requests, sustained for 5 minutes.
+            Troubleshooting: RUNBOOK.md incident "High HTTP 5xx Rate" --
+            check kubectl logs and kubectl rollout history to see if this
+            correlates with a recent deploy.
+
+      # --- High latency -----------------------------------------------------
+      # Condition: 95th percentile request duration.
+      # Threshold: 500ms, matching the Latency SLO in docs/SRE.md.
+      # Duration:  5 minutes.
+      # Reason:    p95 (not average) so a handful of fast health-check
+      #            requests don't mask genuinely slow user-facing ones.
+      - alert: HighLatency
+        expr: |
+          histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le)) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p95 latency above 500ms"
+          description: >
+            Threshold: 500ms at p95, sustained for 5 minutes.
+            Troubleshooting: check the Grafana "Response Latency" panel to
+            see which endpoint is slow, and whether it correlates with
+            high CPU or database latency.
+
+      # --- High CPU usage ---------------------------------------------------
+      # Condition: CPU actively used divided by CPU *requested* for the
+      #            container -- NOT a raw comparison of the cumulative
+      #            counter container_cpu_usage_seconds_total against a
+      #            fixed number, which wouldn't represent a utilization
+      #            percentage at all.
+      # Threshold: 80% of requested CPU (see k8s/base/deployment.yaml
+      #            resources.requests.cpu). Slightly above the HPA's own
+      #            70% scale-out target (k8s/base/hpa.yaml) since this
+      #            alert exists to catch cases where the HPA isn't
+      #            keeping up, not to duplicate its scaling logic.
+      # Duration:  5 minutes.
+      # Reason:    Utilization relative to *requests* is what the HPA
+      #            itself scales on, so this alert and the autoscaler
+      #            agree on what "high CPU" means.
+      # Dependency: requires kube-state-metrics (for
+      #            kube_pod_container_resource_requests), which ships as
+      #            part of the standard kube-prometheus-stack.
+      - alert: HighCPUUsage
+        expr: |
+          (
+            sum by (pod) (rate(container_cpu_usage_seconds_total{pod=~"url-shortener.*", container="url-shortener"}[5m]))
+            /
+            sum by (pod) (kube_pod_container_resource_requests{pod=~"url-shortener.*", container="url-shortener", resource="cpu"})
+          ) > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pod CPU utilization above 80% of its requested CPU"
+          description: >
+            Threshold: 80% of requested CPU, sustained for 5 minutes.
+            Troubleshooting: RUNBOOK.md incident "High CPU Usage" -- check
+            kubectl get hpa and kubectl top pods to see if the HPA is
+            scaling out and whether it's hit maxReplicas.
